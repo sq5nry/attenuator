@@ -147,6 +147,7 @@ void setup() {
   preferences.begin("attenuator", false);
   attenuation = preferences.getUInt("att", 0);
   frequency = preferences.getUInt("freq", 2400);
+  actualAttenuation = preferences.getFloat("actAtt", 0);
 
   blinkDiagnosticLed(4);
 
