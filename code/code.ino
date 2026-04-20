@@ -10,6 +10,7 @@
 
 volatile bool BLUE_LED_DEBUG = true;
 volatile bool SERIAL_DEBUG = false;
+const bool SERIAL_DEBUG_DISABLED = false;    //force no logging even if USB serial connected
 #define PIN_BLUE_LED 15
 
 /*
@@ -40,9 +41,9 @@ Preferences preferences;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 /* rotary encoder */
-const int8_t  DI_ENCODER_SW  = 3;
-const uint8_t DI_ENCODER_A   = 5;
-const uint8_t DI_ENCODER_B   = 4;
+const int8_t  DI_ENCODER_SW  = 5;
+const uint8_t DI_ENCODER_A   = 4;
+const uint8_t DI_ENCODER_B   = 3;
 RotaryEncoder rotaryEncoder(DI_ENCODER_A, DI_ENCODER_B);
 
 //#define PIN_WS2812B  8   // ESP32 pin that connects to WS2812B
@@ -97,6 +98,9 @@ private:
     unsigned int position;
 };
 
+int counter=0, prevCounter=-1;
+bool prevA = 1, prevB = 1;
+
 /*
   program start
 */
@@ -118,7 +122,8 @@ void setup() {
   display.setCursor(0, 0);
   display.println("initializing...");
   display.setCursor(0, 8);
-  if (SERIAL_DEBUG = Serial.isPlugged()) {
+
+  if (!SERIAL_DEBUG_DISABLED && (SERIAL_DEBUG = Serial.isPlugged())) {
     display.println("USB CDC plugged in");
   } else {
     display.println("USB not plugged in");
@@ -163,22 +168,20 @@ void setup() {
   }
   pinMode(DI_ENCODER_SW, INPUT_PULLUP);
 
+  /* rotary encoder */
+  // pinMode (DI_ENCODER_A, INPUT_PULLUP);
+  // pinMode (DI_ENCODER_B, INPUT_PULLUP);
+
   /* finally */
   displayState();
 
-  /* debug */
-  //Serial.begin(921600);
-  //while (!Serial);
-  //delay(2000);
-  //Serial.println("serial port initialized");
-  
   if (SERIAL_DEBUG) Serial.println("ready");
 }
 
 const uint32_t JOB_PERIOD = 60000;  // 60 seconds
 
 // Used by the `loop()` to know when to
-// fire  an event when the knob is turned
+// fire an event when the knob is turned
 volatile bool turnedRightFlag = false;
 volatile bool turnedLeftFlag = false;
 
@@ -218,6 +221,8 @@ void turnedLeft() {
 }
 
 void knobCallback(long value) {
+  Serial.println("knobCallback");
+
 	if (turnedRightFlag || turnedLeftFlag)
 		return;
 
@@ -280,7 +285,7 @@ void displayState() {
   display.setTextSize(2);
 
   char line_att[16];
-  sprintf(line_att, "%5.2fdB", actualAttenuation);
+  sprintf(line_att, "%5.1fdB", actualAttenuation);
   display.setCursor(0,0);
   display.println(line_att);
 
@@ -290,15 +295,17 @@ void displayState() {
   display.println(line_freq);
 
   display.setTextSize(1);
-  display.setCursor(0,32);
+  display.setCursor(0,40);
 
   display.print("min: ");
-  display.println(CAL[0].points[frequency]);
+  display.print(CAL[0].points[frequency]);
+  display.println(" dB");
   display.print("max: ");
-  display.println(CAL[CAL_SIZE-1].points[frequency]);
+  display.print(CAL[CAL_SIZE-1].points[frequency]);
+  display.println(" dB");
   display.print("req: ");
   display.print(attenuation);
-  display.println("dB");
+  display.println(" dB");
 
   display.display();
   // ws2812b.setPixelColor(0, Adafruit_NeoPixel::ColorHSV(258 * attenuation, 255, 255));
@@ -358,8 +365,6 @@ void setupCalibration() {
 
   if (SERIAL_DEBUG) Serial.printf("found %d calibration files\r\n", CAL_SIZE);
   for(int c=0; c < CAL_SIZE; c++) {
-    //String filename = "/0-1000-" + String(c*5) + ".s1p";
-    //CAL[c] = {0, 1000, c*5, readCalibrationFile(LittleFS, filename.c_str())};
     if (SERIAL_DEBUG) Serial.printf("before read: %d dB, [%d-%d]MHz, %s\r\n", calFiles[c].att, calFiles[c].freqStart, calFiles[c].freqEnd, calFiles[c].name);
     CAL[c] = {0, 1000, calFiles[c].att, readCalibrationFile(LittleFS, calFiles[c].name)};
   }
@@ -521,7 +526,7 @@ AttSetting calculateAtt(int requestedAtt, int frequency) {
     y1 = CAL[lowerCalibrationBankIndex].points[frequency];
     if (SERIAL_DEBUG) Serial.printf(", L [%d dB]=%f dB", x1, y1);
   } else {
-    result.attToSet = attenuation;
+    result.attToSet = MIN_ATTENUATION;
     if (SERIAL_DEBUG) Serial.printf(", L not found, forecastAtt=%f", y1);
   }
 
@@ -530,7 +535,7 @@ AttSetting calculateAtt(int requestedAtt, int frequency) {
     y2 = CAL[higherCalibrationBankIndex].points[frequency];
     if (SERIAL_DEBUG) Serial.printf(", H [%d dB]=%f dB", x2, y2);
   } else {
-    result.attToSet = attenuation;
+    result.attToSet = MAX_ATTENUATION;
     if (SERIAL_DEBUG) Serial.printf(", H not found, forecastAtt=%f", y1);
   }
 
@@ -555,7 +560,7 @@ AttSetting calculateAtt(int requestedAtt, int frequency) {
     forecastAtt += y1;
 
     if (SERIAL_DEBUG) Serial.printf(", resultAtt=%f, roundedAtt=%d, forecastAtt=%f\r\n", attenuationToSet, intAttenuationToSet, forecastAtt);
-    result.attToSet = attenuationToSet;
+    result.attToSet = intAttenuationToSet;
     result.estimatedAtt = forecastAtt;
   } else {
     if (SERIAL_DEBUG) Serial.println();
