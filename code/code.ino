@@ -73,12 +73,12 @@ RotaryEncoder rotaryEncoder(DI_ENCODER_A, DI_ENCODER_B);
 // fire an event when the knob is turned
 volatile bool turnedRightFlag = false;
 volatile bool turnedLeftFlag = false;
-
+float* minMaxBuf = (float*) malloc(sizeof(float) * 2);
 
 /*
   types
 */
-struct CalibrationSet { //TODO add CalibrationFile ref
+struct CalibrationSet {
   int startFreq;
   int endFreq;
   int attenuation;
@@ -264,6 +264,23 @@ inline bool isInRange(int frequency, int index) {
   return CAL[index].startFreq <= frequency && frequency <= CAL[index].endFreq;
 }
 
+void getMinMaxAttenuation(float *minMax, int frequency) {
+  minMax[0] = INVALID_ATTENUATION;
+  minMax[1] = INVALID_ATTENUATION;
+
+  for (int c=0; c < CAL_SIZE; c++) {
+    if (!isInRange(frequency, c)) continue;
+    minMax[0] = CAL[c].points[frequency -CAL[c].startFreq];
+    break;
+  }
+
+  for (int c=CAL_SIZE-1; c >= 0; c--) {
+    if (!isInRange(frequency, c)) continue;   
+    minMax[1] = CAL[c].points[frequency - CAL[c].startFreq];
+    break;
+  }
+}
+
 /*
    main loop
 */
@@ -324,21 +341,20 @@ void displayState() {
   display.setTextSize(1);
   display.setCursor(0,40);
 
+  getMinMaxAttenuation(minMaxBuf, frequency);
   display.print("min: ");
-  float min = getPointValue(frequency, 0);
-  if (min == INVALID_ATTENUATION) {
+  if (minMaxBuf[0] == INVALID_ATTENUATION) {
     display.println("no cal data");
   } else {
-    display.print(min);
+    display.print(minMaxBuf[0]);
     display.println(" dB");
   }
 
   display.print("max: ");
-  float max = getPointValue(frequency, CAL_SIZE-1);
-  if (max == INVALID_ATTENUATION) {
+  if (minMaxBuf[1] == INVALID_ATTENUATION) {
     display.println("no cal data");
   } else {
-    display.print(max);
+    display.print(minMaxBuf[1]);
     display.println(" dB");
   }
 
