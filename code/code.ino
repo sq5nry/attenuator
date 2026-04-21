@@ -3,52 +3,77 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-// #include <Adafruit_NeoPixel.h>
 #include <ESP32RotaryEncoder.h>
 #include "FS.h"
 #include <LittleFS.h>
 
+/*
+  user's configuration
+*/
 volatile bool BLUE_LED_DEBUG = true;
 volatile bool SERIAL_DEBUG = false;
-const bool SERIAL_DEBUG_DISABLED = false;    //force no logging even if USB serial connected
-#define PIN_BLUE_LED 15
+const bool SERIAL_DEBUG_DISABLED = false;   //force no logging even if USB serial connected
+const char* CAL_FILES_DIR = "/";            //default is root directory
+const int ATT_INCREMENT_NORMAL = 1;
+const int FREQ_INCREMENT_NORMAL = 1;
+const int ATT_INCREMENT_FAST = 10;
+const int FREQ_INCREMENT_FAST = 100;
 
 /*
-  physical properties of the executive attenuator
+  hardware configuration
 */
+#define PIN_BLUE_LED 15
+
+//physical properties of the executive attenuator
 #define MAX_ATTENUATION 127
 #define MIN_ATTENUATION 0
 #define MAX_FREQUENCY 3000
-#define MIN_FREQUENCY 0
+#define MIN_FREQUENCY 1
 
-/* attenuator controls
-   1/2/4/8/16/32/64dB
- */ 
+//attenuator GPO to relays wiring 1/2/4/8/16/32/64dB
 const uint8_t ATT_SW[7] = {0, 20, 9, 19, 18, 1, 14};
 
-/* attenuator state */ 
-volatile int attenuation, frequency;
+//display
+#define SCREEN_SDA 6
+#define SCREEN_SCL 7
+#define SCREEN_ADDRESS 0x3C
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+
+//rotary encoder
+const uint8_t DI_ENCODER_A = 4;
+const uint8_t DI_ENCODER_B = 3;
+
+//switches
+const uint8_t FREQ_ATT_SWITCH = 5;
+const uint8_t FAST_SWITCH = 2;
+
+//autosave
+const uint32_t JOB_PERIOD = 60000;  // 60 seconds
+
+
+/*
+  global variables
+*/
+//attenuator state
+volatile int attenuation, frequency, rawAttenuation;
 volatile float actualAttenuation;
 int storedAttenuation, storedFrequency;
 float storedActualAttenuation;
 
+struct CalibrationSet* CAL;
+int CAL_SIZE = 0;
+
 Preferences preferences;
-
-/* display */
-#define SCREEN_WIDTH  128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1 // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-/* rotary encoder */
-const int8_t  DI_ENCODER_SW  = 5;
-const uint8_t DI_ENCODER_A   = 4;
-const uint8_t DI_ENCODER_B   = 3;
 RotaryEncoder rotaryEncoder(DI_ENCODER_A, DI_ENCODER_B);
 
-//#define PIN_WS2812B  8   // ESP32 pin that connects to WS2812B
-//#define NUM_PIXELS   1  // The number of LEDs (pixels) on WS2812B
-// Adafruit_NeoPixel ws2812b(NUM_PIXELS, PIN_WS2812B, NEO_GRB + NEO_KHZ800);
+// Used by the `loop()` to know when to
+// fire an event when the knob is turned
+volatile bool turnedRightFlag = false;
+volatile bool turnedLeftFlag = false;
+
 
 /*
   types
@@ -68,14 +93,10 @@ struct CalibrationFile {
 };
 
 struct AttSetting {
-  int requestedAtt;
-  int attToSet;
-  float estimatedAtt;
+  int requestedAtt;   //requested attenuation
+  int attToSet;       //attenuator setting for best match
+  float estimatedAtt; //effective attenuation, may differ from the requested by 1dB max
 };
-
-const char* CAL_FILES_DIR = "/";
-struct CalibrationSet* CAL;
-int CAL_SIZE = 0;
 
 /* 
   credits: https://gist.github.com/arcao
@@ -98,19 +119,18 @@ private:
     unsigned int position;
 };
 
-int counter=0, prevCounter=-1;
-bool prevA = 1, prevB = 1;
+const float INVALID_ATTENUATION = -1.0f;
 
 /*
-  program start
+  program start, setup
 */
 void setup() {
   pinMode(PIN_BLUE_LED, OUTPUT);
   blinkDiagnosticLed(1);
 
   /* display */
-  Wire.begin(6, 7); // SDA, SCL
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+  Wire.begin(SCREEN_SDA, SCREEN_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     for(;;);
   }
 
@@ -157,48 +177,35 @@ void setup() {
   rotaryEncoder.onTurned(&knobCallback);
   rotaryEncoder.begin();
 
-  /* diagnostic LEDs */
-  // ws2812b.begin();
-  // ws2812b.show();
-
   blinkDiagnosticLed(5);
 
   /* attenuator switch */
   for (int i=0; i<7; i++) {
     pinMode(ATT_SW[i], OUTPUT);
   }
-  pinMode(DI_ENCODER_SW, INPUT_PULLUP);
-
-  /* rotary encoder */
-  // pinMode (DI_ENCODER_A, INPUT_PULLUP);
-  // pinMode (DI_ENCODER_B, INPUT_PULLUP);
+  pinMode(FREQ_ATT_SWITCH, INPUT_PULLUP);
+  pinMode(FAST_SWITCH, INPUT_PULLUP);
 
   /* finally */
+  setAttenuator(attenuation, frequency);
   displayState();
 
   if (SERIAL_DEBUG) Serial.println("ready");
 }
-
-const uint32_t JOB_PERIOD = 60000;  // 60 seconds
-
-// Used by the `loop()` to know when to
-// fire an event when the knob is turned
-volatile bool turnedRightFlag = false;
-volatile bool turnedLeftFlag = false;
 
 void onEncoderTurned() {
   setAttenuator(attenuation, frequency);
   displayState();
 }
 
-void turnedRight() {
-  if (digitalRead(DI_ENCODER_SW)) {
+void turnedRight(bool isFast) {
+  if (digitalRead(FREQ_ATT_SWITCH)) {
     if (attenuation < MAX_ATTENUATION) {
-      attenuation++;
+      attenuation += isFast ? ATT_INCREMENT_FAST : ATT_INCREMENT_NORMAL;
     }
   } else {
     if (frequency < MAX_FREQUENCY) {
-      frequency += 10;
+      frequency += isFast ? FREQ_INCREMENT_FAST : FREQ_INCREMENT_NORMAL;
     }
   }
   
@@ -206,14 +213,16 @@ void turnedRight() {
   onEncoderTurned();
 }
 
-void turnedLeft() {
-  if (digitalRead(DI_ENCODER_SW)) {
+void turnedLeft(bool isFast) {
+  if (digitalRead(FREQ_ATT_SWITCH)) {
     if (attenuation > MIN_ATTENUATION) {
-      attenuation--;
+      attenuation -= isFast ? ATT_INCREMENT_FAST : ATT_INCREMENT_NORMAL;
+      if (attenuation < 0) attenuation = 0;
     }
   } else {
-    if (frequency > MIN_FREQUENCY) {
-      frequency -= 10;
+    if (frequency >= MIN_FREQUENCY) {
+      frequency -= isFast ? FREQ_INCREMENT_FAST : FREQ_INCREMENT_NORMAL;
+      if (frequency < MIN_FREQUENCY) frequency = MIN_FREQUENCY;
     }
   }
 
@@ -222,8 +231,6 @@ void turnedLeft() {
 }
 
 void knobCallback(long value) {
-  Serial.println("knobCallback");
-
 	if (turnedRightFlag || turnedLeftFlag)
 		return;
 
@@ -242,6 +249,19 @@ void knobCallback(long value) {
 	// Override the tracked value back to 0 so that
 	// we can continue tracking right/left events
 	rotaryEncoder.setEncoderValue(0);
+}
+
+inline float getPointValue(int frequency, int index) {
+  if (isInRange(frequency, index)) {
+    int adjustedIndex = frequency - CAL[index].startFreq;
+    return CAL[index].points[adjustedIndex];
+  }
+
+  return INVALID_ATTENUATION;
+}
+
+inline bool isInRange(int frequency, int index) {
+  return CAL[index].startFreq <= frequency && frequency <= CAL[index].endFreq;
 }
 
 /*
@@ -271,10 +291,11 @@ void loop() {
   /*
     encoder
   */
+  bool isFast = digitalRead(FAST_SWITCH) == 0;
 	if (turnedRightFlag) {
-    turnedRight();
+    turnedRight(isFast);
   } else if (turnedLeftFlag) {
-		turnedLeft();
+		turnedLeft(isFast);
   }
 }
 
@@ -286,12 +307,17 @@ void displayState() {
   display.setTextSize(2);
 
   char line_att[16];
-  sprintf(line_att, "%5.1fdB", actualAttenuation);
   display.setCursor(0,0);
-  display.println(line_att);
+  if (actualAttenuation != INVALID_ATTENUATION) {
+    if (actualAttenuation < 0.0f) actualAttenuation = 0.0f; //remove tiny glitches from calibration around zero
+    sprintf(line_att, "  %5.1fdB", actualAttenuation);
+    display.println(line_att);
+  } else {
+    display.println("     --");
+  }
 
   char line_freq[16];
-  sprintf(line_freq, "%4dMHz", frequency);
+  sprintf(line_freq, "  %4dMHz", frequency);
   display.setCursor(0,16);
   display.println(line_freq);
 
@@ -299,20 +325,28 @@ void displayState() {
   display.setCursor(0,40);
 
   display.print("min: ");
-  display.print(CAL[0].points[frequency]);
-  display.println(" dB");
+  float min = getPointValue(frequency, 0);
+  if (min == INVALID_ATTENUATION) {
+    display.println("no cal data");
+  } else {
+    display.print(min);
+    display.println(" dB");
+  }
+
   display.print("max: ");
-  display.print(CAL[CAL_SIZE-1].points[frequency]);
-  display.println(" dB");
+  float max = getPointValue(frequency, CAL_SIZE-1);
+  if (max == INVALID_ATTENUATION) {
+    display.println("no cal data");
+  } else {
+    display.print(max);
+    display.println(" dB");
+  }
+
   display.print("req: ");
   display.print(attenuation);
   display.println(" dB");
 
   display.display();
-  // ws2812b.setPixelColor(0, Adafruit_NeoPixel::ColorHSV(258 * attenuation, 255, 255));
-  // ws2812b.setBrightness(10);
-  // ws2812b.begin();
-  // ws2812b.show();
 }
 
 void blinkDiagnosticLed(int times) {
@@ -330,6 +364,7 @@ void blinkDiagnosticLed(int times) {
 void setAttenuator(int attenuation, int frequency) {
   AttSetting result = calculateAtt(attenuation, frequency);
   actualAttenuation = result.estimatedAtt;
+  rawAttenuation = result.attToSet;
   for (int i=0; i<7; i++) {
     if (result.attToSet & (1<<i))
       digitalWrite(ATT_SW[i], HIGH);
@@ -349,7 +384,9 @@ void setupCalibration() {
     return;
   }
 
-  display.println("reading calibration data");
+  if (SERIAL_DEBUG) Serial.printf("total bytes: %u, used bytes: %u\n", LittleFS.totalBytes(), LittleFS.usedBytes());
+
+  display.println("listing cal files");
   display.display();
 
   CalibrationFile* calFiles = getCalibrationFiles(LittleFS, CAL_FILES_DIR);
@@ -367,7 +404,12 @@ void setupCalibration() {
   if (SERIAL_DEBUG) Serial.printf("found %d calibration files\r\n", CAL_SIZE);
   for(int c=0; c < CAL_SIZE; c++) {
     if (SERIAL_DEBUG) Serial.printf("before read: %d dB, [%d-%d]MHz, %s\r\n", calFiles[c].att, calFiles[c].freqStart, calFiles[c].freqEnd, calFiles[c].name);
-    CAL[c] = {0, 1000, calFiles[c].att, readCalibrationFile(LittleFS, calFiles[c].name)};
+    CAL[c] = {
+      calFiles[c].freqStart, 
+      calFiles[c].freqEnd, 
+      calFiles[c].att, 
+      readCalibrationFile(LittleFS, calFiles[c].name, calFiles[c].freqStart)
+    };
   }
 
   bubbleSort(CAL, 0, CAL_SIZE-1);
@@ -376,7 +418,7 @@ void setupCalibration() {
       Serial.printf("CAL[%d]: %d-%dMHz, %ddB\r\n", c, CAL[c].startFreq, CAL[c].endFreq, CAL[c].attenuation);
 }
 
-void bubbleSort(CalibrationSet* array, byte from, byte upTo) {
+void bubbleSort(CalibrationSet* array, byte from, byte upTo) {  //TODO use qsort from stdlib if available
  byte swaps;  
  do {
     swaps=0;
@@ -390,7 +432,7 @@ void bubbleSort(CalibrationSet* array, byte from, byte upTo) {
   } while (swaps);
 }
 
-float* readCalibrationFile(fs::FS &fs, const char *fileName) {
+float* readCalibrationFile(fs::FS &fs, const char *fileName, int startFreq) {
   char* fullPath = (char*) malloc(strlen(CAL_FILES_DIR) + strlen(fileName) + 1);
   if (fullPath == NULL) {
     if (SERIAL_DEBUG) Serial.println("readCalibrationFile: could not allocate buffer");
@@ -417,9 +459,11 @@ float* readCalibrationFile(fs::FS &fs, const char *fileName) {
   display.display();
 
   int lines = -1;
+  String comment;
   while (file.available()) {
     if ('!' == file.peek()) { // skip s1p comments
-      file.readStringUntil('\n');
+      comment = file.readStringUntil('\n');
+      if (SERIAL_DEBUG) Serial.println(comment);
       continue;
     }
 
@@ -427,7 +471,7 @@ float* readCalibrationFile(fs::FS &fs, const char *fileName) {
     file.parseFloat(SKIP_WHITESPACE);                   // angle, not needed
     float c = file.parseFloat(SKIP_WHITESPACE) * -1.0f; // attenuation
     lines++;
-    att[a] = c;
+    att[a - startFreq] = c;
   }
   file.close();
 
@@ -457,6 +501,7 @@ struct CalibrationFile* getCalibrationFiles(fs::FS &fs, const char *dirname) {
       Serial.print("\tsize: ");
       Serial.println(file.size());
     }
+
     count++;
     file = root.openNextFile();
   }
@@ -510,12 +555,16 @@ AttSetting calculateAtt(int requestedAtt, int frequency) {
   int lowerCalibrationBankIndex = -1;
   int higherCalibrationBankIndex= -1;
   for (int c=0; c < CAL_SIZE; c++) {
-    if (CAL[c].points[frequency] <= requestedAtt) {
+    if (SERIAL_DEBUG) Serial.printf("\r\nL inRange %d, frequency=%d, c=%d, CAL[c].startFreq=%d, CAL[c].point=%4.2f\r\n", isInRange(frequency, c), frequency, c, CAL[c].startFreq, getPointValue(frequency, c));
+    if (!isInRange(frequency, c)) continue;
+    if (getPointValue(frequency, c) <= requestedAtt) {
         lowerCalibrationBankIndex = c;
-    } else break;
+    } else break; //previous index was the best, abandon search
   }
   for (int c=CAL_SIZE-1; c >= 0; c--) {
-    if (CAL[c].points[frequency] >= requestedAtt) {
+    if (SERIAL_DEBUG) Serial.printf("\r\nH inRange %d, frequency=%d, c=%d, CAL[c].startFreq=%d, CAL[c].point=%4.2f\r\n", isInRange(frequency, c), frequency, c, CAL[c].startFreq, getPointValue(frequency, c));
+    if (!isInRange(frequency, c)) continue;   
+    if (getPointValue(frequency, c) >= requestedAtt) {
         higherCalibrationBankIndex = c;
     } else break;
   }
@@ -524,7 +573,7 @@ AttSetting calculateAtt(int requestedAtt, int frequency) {
   float y1, y2;
   if (lowerCalibrationBankIndex != -1) {
     x1 = CAL[lowerCalibrationBankIndex].attenuation;
-    y1 = CAL[lowerCalibrationBankIndex].points[frequency];
+    y1 = getPointValue(frequency, lowerCalibrationBankIndex);
     if (SERIAL_DEBUG) Serial.printf(", L [%d dB]=%f dB", x1, y1);
   } else {
     result.attToSet = MIN_ATTENUATION;
@@ -533,18 +582,26 @@ AttSetting calculateAtt(int requestedAtt, int frequency) {
 
   if (higherCalibrationBankIndex != -1) {
     x2 = CAL[higherCalibrationBankIndex].attenuation;
-    y2 = CAL[higherCalibrationBankIndex].points[frequency];
+    y2 = getPointValue(frequency, higherCalibrationBankIndex);
     if (SERIAL_DEBUG) Serial.printf(", H [%d dB]=%f dB", x2, y2);
   } else {
     result.attToSet = MAX_ATTENUATION;
     if (SERIAL_DEBUG) Serial.printf(", H not found, forecastAtt=%f", y1);
   }
 
+  //no calibration data for request
+  if (lowerCalibrationBankIndex == -1 && higherCalibrationBankIndex == -1) {
+    result.attToSet = MAX_ATTENUATION;
+    result.estimatedAtt = INVALID_ATTENUATION;
+    if (SERIAL_DEBUG) Serial.println("no calibration data for request");
+    return result;
+  }
+
   //insufficient or too much than requested
   if (lowerCalibrationBankIndex == -1) {
-    result.estimatedAtt = CAL[higherCalibrationBankIndex].points[frequency];
+    result.estimatedAtt = getPointValue(frequency, higherCalibrationBankIndex);
   } else if (higherCalibrationBankIndex == -1) {
-    result.estimatedAtt = CAL[lowerCalibrationBankIndex].points[frequency];
+    result.estimatedAtt = getPointValue(frequency, lowerCalibrationBankIndex);
   }
 
   //requested attenuation found between two calibration datasets
@@ -569,3 +626,4 @@ AttSetting calculateAtt(int requestedAtt, int frequency) {
 
   return result;
 }
+
