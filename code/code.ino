@@ -25,10 +25,10 @@ const int FREQ_INCREMENT_FAST = 100;
 #define PIN_BLUE_LED 15
 
 //physical properties of the executive attenuator
-#define MAX_ATTENUATION 127
-#define MIN_ATTENUATION 0
-#define MAX_FREQUENCY 3000
-#define MIN_FREQUENCY 1
+const int MAX_ATTENUATION = 127;
+const int MIN_ATTENUATION = 0;
+const int MAX_FREQUENCY = 3000;
+const int MIN_FREQUENCY = 1;
 
 //attenuator GPO to relays wiring 1/2/4/8/16/32/64dB
 const uint8_t ATT_SW[7] = {0, 20, 9, 19, 18, 1, 14};
@@ -47,7 +47,7 @@ const uint8_t DI_ENCODER_B = 3;
 
 //switches
 const uint8_t FREQ_ATT_SWITCH = 5;
-const uint8_t FAST_SWITCH = 2;
+const uint8_t FAST_SWITCH = 2;    //press on boot to enter raw mode
 
 //autosave
 const uint32_t JOB_PERIOD = 60000;  // 60 seconds
@@ -56,6 +56,8 @@ const uint32_t JOB_PERIOD = 60000;  // 60 seconds
 /*
   global variables
 */
+bool directMode = false; //direct attenuation control, no calibration data assumed
+
 //attenuator state
 volatile int attenuation, frequency, rawAttenuation;
 volatile float actualAttenuation;
@@ -125,6 +127,12 @@ const float INVALID_ATTENUATION = -1.0f;
   program start, setup
 */
 void setup() {
+  pinMode(FAST_SWITCH, INPUT_PULLUP);
+  if (digitalRead(FAST_SWITCH) == 0) {
+    directMode = true;
+    blinkDiagnosticLed(6);
+  }
+
   pinMode(PIN_BLUE_LED, OUTPUT);
   blinkDiagnosticLed(1);
 
@@ -161,13 +169,21 @@ void setup() {
     }
   }
 
-  setupCalibration();
-
-  /* recall stored attenuator state */
-  preferences.begin("attenuator", false);
-  attenuation = preferences.getUInt("att", 0);
-  frequency = preferences.getUInt("freq", 2400);
-  actualAttenuation = preferences.getFloat("actAtt", 0);
+  if (!directMode) {
+    setupCalibration();
+    /* recall stored attenuator state */
+    preferences.begin("attenuator", false);
+    attenuation = preferences.getUInt("att", 0);
+    frequency = preferences.getUInt("freq", 2400);
+    actualAttenuation = preferences.getFloat("actAtt", 0);
+  } else {
+    attenuation = 0;
+    if (SERIAL_DEBUG) {
+      Serial.println("raw mode");
+      Serial.print("attenuation: ");
+      Serial.println(attenuation);
+    }
+  }
 
   blinkDiagnosticLed(4);
 
@@ -184,7 +200,6 @@ void setup() {
     pinMode(ATT_SW[i], OUTPUT);
   }
   pinMode(FREQ_ATT_SWITCH, INPUT_PULLUP);
-  pinMode(FAST_SWITCH, INPUT_PULLUP);
 
   /* finally */
   setAttenuator(attenuation, frequency);
@@ -289,7 +304,7 @@ void loop() {
     store settings periodically
   */
   static uint32_t previousMillis;
-  if (millis() - previousMillis >= JOB_PERIOD) {
+  if (!directMode && millis() - previousMillis >= JOB_PERIOD) {
       if (storedAttenuation !=  attenuation) {
         preferences.putUInt("att", attenuation);
         storedAttenuation = attenuation;
@@ -325,42 +340,53 @@ void displayState() {
 
   char line_att[16];
   display.setCursor(0,0);
+  if (directMode) {
+    actualAttenuation = attenuation;
+  }
   if (actualAttenuation != INVALID_ATTENUATION) {
     if (actualAttenuation < 0.0f) actualAttenuation = 0.0f; //remove tiny glitches from calibration around zero
-    sprintf(line_att, "  %5.1fdB", actualAttenuation);
+    if (directMode) {
+      sprintf(line_att, "   %3.0fdB", actualAttenuation);
+    } else {
+      sprintf(line_att, "  %5.1fdB", actualAttenuation);
+    }
     display.println(line_att);
   } else {
     display.println("     --");
   }
 
-  char line_freq[16];
-  sprintf(line_freq, "  %4dMHz", frequency);
   display.setCursor(0,16);
-  display.println(line_freq);
-
-  display.setTextSize(1);
-  display.setCursor(0,40);
-
-  getMinMaxAttenuation(minMaxBuf, frequency);
-  display.print("min: ");
-  if (minMaxBuf[0] == INVALID_ATTENUATION) {
-    display.println("no cal data");
+  if (directMode) {
+    display.println("   direct");
   } else {
-    display.print(minMaxBuf[0]);
+    char line_freq[16];
+    sprintf(line_freq, "  %4dMHz", frequency);
+    display.println(line_freq);
+
+    display.setTextSize(1);
+    display.setCursor(0,40);
+
+    getMinMaxAttenuation(minMaxBuf, frequency);
+    display.print("min: ");
+    if (minMaxBuf[0] == INVALID_ATTENUATION) {
+      display.println("no cal data");
+    } else {
+      display.print(minMaxBuf[0]);
+      display.println(" dB");
+    }
+
+    display.print("max: ");
+    if (minMaxBuf[1] == INVALID_ATTENUATION) {
+      display.println("no cal data");
+    } else {
+      display.print(minMaxBuf[1]);
+      display.println(" dB");
+    }
+
+    display.print("req: ");
+    display.print(attenuation);
     display.println(" dB");
   }
-
-  display.print("max: ");
-  if (minMaxBuf[1] == INVALID_ATTENUATION) {
-    display.println("no cal data");
-  } else {
-    display.print(minMaxBuf[1]);
-    display.println(" dB");
-  }
-
-  display.print("req: ");
-  display.print(attenuation);
-  display.println(" dB");
 
   display.display();
 }
@@ -378,9 +404,17 @@ void blinkDiagnosticLed(int times) {
 }
 
 void setAttenuator(int attenuation, int frequency) {
-  AttSetting result = calculateAtt(attenuation, frequency);
-  actualAttenuation = result.estimatedAtt;
-  rawAttenuation = result.attToSet;
+  AttSetting result;
+  if (directMode) {
+    result.attToSet = attenuation;
+    result.estimatedAtt = attenuation;
+    result.requestedAtt = attenuation;
+  } else {
+    result = calculateAtt(attenuation, frequency);
+    actualAttenuation = result.estimatedAtt;
+    rawAttenuation = result.attToSet;
+  }
+
   for (int i=0; i<7; i++) {
     if (result.attToSet & (1<<i))
       digitalWrite(ATT_SW[i], HIGH);
